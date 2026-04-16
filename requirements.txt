@@ -7,3 +7,4 @@ scikit-learn
 xgboost
 tensorflow-cpu
 gunicorn
+setuptools
