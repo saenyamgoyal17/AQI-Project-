@@ -188,10 +188,21 @@ def get_pm25_series(city):
         raise e
 
 
-def run_aqi_prediction_model(df, country_code, live_aqi):
-    """Predict next-hour AQI using historical AQI (not PM2.5-derived AQI)."""
+def _future_weather_value(series, step_idx):
+    """Use diurnal pattern from ~24h ago when available for forecast step features."""
+    arr = pd.to_numeric(series, errors="coerce").ffill().bfill().values
+    if len(arr) == 0:
+        return 0.0
+    historical_idx = len(arr) - 24 + step_idx
+    if 0 <= historical_idx < len(arr):
+        return float(arr[historical_idx])
+    return float(arr[-1])
+
+
+def run_aqi_multi_step_forecast(df, country_code, live_aqi, steps=5):
+    """Predict AQI for next N hours recursively using ARIMA/SARIMA + ML residual models."""
     if live_aqi is None:
-        return None
+        return []
 
     use_eu = (country_code or "").upper() in EU_COUNTRY_CODES
     preferred_col = "eu_aqi" if use_eu else "us_aqi"
@@ -203,19 +214,28 @@ def run_aqi_prediction_model(df, country_code, live_aqi):
 
     aqi_series = aqi_series.dropna().reset_index(drop=True)
     if len(aqi_series) < 30:
-        return round(float(live_aqi), 1)
+        return [round(float(live_aqi), 1)] * int(steps)
 
-    # Align historical model state with the station-reported live AQI.
     aqi_series.iloc[-1] = float(live_aqi)
 
     try:
         stl = STL(aqi_series, period=24, robust=True)
         stl_result = stl.fit()
-
         trend = stl_result.trend.dropna()
         resid = stl_result.resid.dropna()
 
-        arima_future = ARIMA(trend, order=(1, 1, 1)).fit().forecast(steps=1).iloc[0]
+        arima_trend = ARIMA(trend, order=(1, 1, 1)).fit().forecast(steps=steps).values
+        try:
+            sarima_trend = SARIMAX(
+                trend,
+                order=(1, 1, 1),
+                seasonal_order=(1, 0, 1, 24),
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+            ).fit(disp=False).forecast(steps=steps).values
+            trend_forecast = (arima_trend + sarima_trend) / 2.0
+        except Exception:
+            trend_forecast = arima_trend
 
         df_ml = pd.DataFrame({
             "resid": resid.values,
@@ -223,41 +243,83 @@ def run_aqi_prediction_model(df, country_code, live_aqi):
             "humidity": df["humidity"].values[-len(resid):],
             "wind": df["wind"].values[-len(resid):]
         })
-
         df_ml["lag1"] = df_ml["resid"].shift(1)
         df_ml["lag2"] = df_ml["resid"].shift(2)
+        df_ml["arima_feature"] = float(trend_forecast[0])
         df_ml = df_ml.dropna()
 
         if len(df_ml) < 20:
-            raw_pred = arima_future
-        else:
-            X = df_ml[["lag1", "lag2", "temp", "humidity", "wind"]].values
-            y = df_ml["resid"].values
+            return [round(float(v), 1) for v in trend_forecast]
 
-            rf = RandomForestRegressor(n_estimators=30, n_jobs=1)
-            rf.fit(X, y)
+        X = df_ml[["lag1", "lag2", "temp", "humidity", "wind", "arima_feature"]].values
+        y = df_ml["resid"].values
 
-            xgb = XGBRegressor(n_estimators=30, n_jobs=1)
-            xgb.fit(X, y)
+        rf = RandomForestRegressor(n_estimators=30, n_jobs=1, random_state=42)
+        rf.fit(X, y)
+        xgb = XGBRegressor(n_estimators=30, n_jobs=1, random_state=42)
+        xgb.fit(X, y)
 
-            latest = np.array([[
-                resid.iloc[-1],
-                resid.iloc[-2],
-                df["temp"].iloc[-1],
-                df["humidity"].iloc[-1],
-                df["wind"].iloc[-1]
-            ]])
+        lstm_model = None
+        if KERAS_AVAILABLE and len(df_ml) >= 40:
+            try:
+                X_lstm = X.reshape((X.shape[0], 1, X.shape[1]))
+                lstm_model = Sequential([
+                    LSTM(16, input_shape=(1, X.shape[1])),
+                    Dense(8, activation="relu"),
+                    Dense(1),
+                ])
+                lstm_model.compile(optimizer="adam", loss="mse")
+                lstm_model.fit(X_lstm, y, epochs=12, batch_size=16, verbose=0)
+            except Exception:
+                lstm_model = None
 
-            rf_future = rf.predict(latest)[0]
-            xgb_future = xgb.predict(latest)[0]
-            raw_pred = arima_future + np.mean([rf_future, xgb_future])
+        lag1 = float(resid.iloc[-1])
+        lag2 = float(resid.iloc[-2])
+        prev_aqi = float(live_aqi)
+        forecast = []
 
-        max_change = max(15.0, float(live_aqi) * 0.20)
-        bounded_pred = min(float(live_aqi) + max_change, max(float(live_aqi) - max_change, float(raw_pred)))
-        bounded_pred = min(500.0, max(0.0, bounded_pred))
-        return round(bounded_pred, 1)
+        for i in range(int(steps)):
+            t_future = _future_weather_value(df["temp"], i)
+            h_future = _future_weather_value(df["humidity"], i)
+            w_future = _future_weather_value(df["wind"], i)
+            a_feature = float(trend_forecast[i])
+
+            features = np.array([[lag1, lag2, t_future, h_future, w_future, a_feature]])
+            rf_res = float(rf.predict(features)[0])
+            xgb_res = float(xgb.predict(features)[0])
+            residual_components = [rf_res, xgb_res]
+
+            if lstm_model is not None:
+                try:
+                    lstm_res = float(lstm_model.predict(features.reshape((1, 1, features.shape[1])), verbose=0)[0][0])
+                    residual_components.append(lstm_res)
+                except Exception:
+                    pass
+
+            residual_pred = float(np.mean(residual_components))
+            raw_aqi = a_feature + residual_pred
+
+            # Recursive stability bound relative to previous hour.
+            step_bound = max(12.0, prev_aqi * 0.18)
+            bounded = min(prev_aqi + step_bound, max(prev_aqi - step_bound, raw_aqi))
+            bounded = min(500.0, max(0.0, bounded))
+            forecast.append(round(float(bounded), 1))
+
+            lag2 = lag1
+            lag1 = residual_pred
+            prev_aqi = float(bounded)
+
+        return forecast
     except Exception:
-        return round(float(live_aqi), 1)
+        return [round(float(live_aqi), 1)] * int(steps)
+
+
+def run_aqi_prediction_model(df, country_code, live_aqi):
+    """Backward-compatible 1-step wrapper around multi-step AQI model."""
+    multi = run_aqi_multi_step_forecast(df, country_code, live_aqi, steps=1)
+    if not multi:
+        return round(float(live_aqi), 1) if live_aqi is not None else None
+    return float(multi[0])
 
 
 ###########################################
@@ -500,9 +562,69 @@ def get_aqi_category(aqi, system_label):
         return "Hazardous"
 
 
-def get_multi_hour_forecast(prediction_1hr):
-    """UI expects a list; keep one AQI value (next-hour prediction)."""
-    return [round(float(prediction_1hr), 1)] if prediction_1hr is not None else []
+def get_multi_hour_forecast(prediction_1hr, current_aqi):
+    """Return a validated 5-point forecast array."""
+    if prediction_1hr is None:
+        return []
+    if isinstance(prediction_1hr, (list, tuple, np.ndarray)):
+        series = [float(v) for v in prediction_1hr]
+    else:
+        series = [float(prediction_1hr)]
+
+    if len(series) < 5:
+        fill = series[-1]
+        series.extend([fill] * (5 - len(series)))
+    return [round(v, 1) for v in series[:5]]
+
+
+def build_pollution_alert(current_aqi, predicted_aqi, system_label):
+    """Generate an explicit early-alert signal using threshold + rapid-rise rules."""
+    if current_aqi is None:
+        return {
+            "level": "INFO",
+            "title": "No Alert Data",
+            "reason": "Live AQI not available for alert computation.",
+            "action": "Retry in a few minutes.",
+        }
+
+    current = float(current_aqi)
+    pred = float(predicted_aqi) if predicted_aqi is not None else current
+    delta = pred - current
+    pct_rise = (delta / max(current, 1.0)) * 100.0
+
+    is_eu = "European AQI" in (system_label or "")
+    if is_eu:
+        high_threshold = 60.0
+        severe_threshold = 80.0
+    else:
+        high_threshold = 150.0
+        severe_threshold = 200.0
+
+    rapid_rise = delta >= 25.0 or pct_rise >= 20.0
+
+    if current >= severe_threshold or pred >= severe_threshold:
+        return {
+            "level": "SEVERE",
+            "title": "Severe Pollution Alert",
+            "reason": f"Current AQI {round(current)} and predicted AQI {round(pred)} indicate severe risk.",
+            "action": "Avoid outdoor exposure, use N95 masks, and limit physical activity.",
+        }
+
+    if current >= high_threshold or pred >= high_threshold or rapid_rise:
+        rise_msg = f" Rapid rise detected (+{round(delta, 1)} AQI, {round(pct_rise, 1)}%)." if rapid_rise else ""
+        return {
+            "level": "WARNING",
+            "title": "Early Pollution Warning",
+            "reason": f"AQI trending upward from {round(current)} to {round(pred)}.{rise_msg}",
+            "action": "Reduce prolonged outdoor activity and monitor AQI over the next few hours.",
+        }
+
+    return {
+        "level": "NORMAL",
+        "title": "Air Quality Stable",
+        "reason": f"Current AQI {round(current)} and predicted AQI {round(pred)} are in a controlled range.",
+        "action": "No immediate action required. Continue routine monitoring.",
+    }
 
 
 ###########################################
@@ -518,6 +640,7 @@ def home():
     country_name = None
     rmse = mae = mape = r2 = dominant_factor = None
     hourly_forecasts = []
+    alert_info = None
 
     if request.method == "POST":
         city = request.form["city"]
@@ -555,12 +678,14 @@ def home():
                 raise Exception("Live AQI is not available from the API for this city right now.")
 
             # Predict AQI using AQI history model (not PM2.5-to-AQI approximation).
-            predicted_aqi = run_aqi_prediction_model(df, country_code, prediction)
-            hourly_forecasts = get_multi_hour_forecast(predicted_aqi)
+            multi_step_aqi = run_aqi_multi_step_forecast(df, country_code, prediction, steps=5)
+            hourly_forecasts = get_multi_hour_forecast(multi_step_aqi, prediction)
+            predicted_aqi = hourly_forecasts[0] if hourly_forecasts else prediction
+            alert_info = build_pollution_alert(prediction, predicted_aqi, aqi_system_label)
             
             category = get_aqi_category(prediction, aqi_system_label)
         except Exception as e:
-            return render_template("index.html", error=str(e), city=city, hourly_forecasts=[])
+            return render_template("index.html", error=str(e), city=city, hourly_forecasts=[], alert_info=None)
 
     return render_template(
         "index.html",
@@ -569,7 +694,8 @@ def home():
         aqi_system_label=aqi_system_label, aqi_source_label=aqi_source_label,
         country_name=country_name,
         rmse=rmse, mae=mae, mape=mape, r2=r2, dominant_factor=dominant_factor,
-        hourly_forecasts=hourly_forecasts
+        hourly_forecasts=hourly_forecasts,
+        alert_info=alert_info
     )
 
 

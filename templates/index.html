@@ -110,6 +110,16 @@
         .aqi-number { font-family: var(--font-display); font-size: 6.5rem; font-weight: 700; line-height: 0.9; letter-spacing: -0.05em; color: #fff;}
         .health-badge { margin-top: 1rem; display: inline-flex; align-items: center; gap: 8px; padding: 10px 24px; border-radius: 100px; background: rgba(var(--theme-color-rgb), 0.1); border: 1px solid rgba(var(--theme-color-rgb), 0.3); font-size: 0.85rem; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; color: var(--theme-color); }
 
+        /* Early Alert Engine */
+        .alert-card { grid-column: span 12; border: 1px solid var(--border-light); }
+        .alert-card.severe { border-color: rgba(255, 69, 58, 0.55); background: linear-gradient(135deg, rgba(255, 69, 58, 0.16), rgba(8, 8, 10, 0.9)); }
+        .alert-card.warning { border-color: rgba(255, 159, 10, 0.55); background: linear-gradient(135deg, rgba(255, 159, 10, 0.14), rgba(8, 8, 10, 0.9)); }
+        .alert-card.normal { border-color: rgba(50, 215, 75, 0.45); background: linear-gradient(135deg, rgba(50, 215, 75, 0.1), rgba(8, 8, 10, 0.9)); }
+        .alert-head { display: flex; align-items: center; gap: 12px; margin-bottom: 1rem; }
+        .alert-level { font-family: var(--font-mono); font-size: 0.8rem; letter-spacing: 0.12em; padding: 6px 10px; border-radius: 999px; border: 1px solid var(--border-light); color: #fff; }
+        .alert-title { font-family: var(--font-display); font-size: 1.35rem; font-weight: 700; }
+        .alert-row { color: rgba(255,255,255,0.78); line-height: 1.55; margin-top: 0.35rem; }
+
         /* Live Terminal */
         .terminal-header { display: flex; gap: 8px; margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border-light);}
         .dot { width: 12px; height: 12px; border-radius: 50%; }
@@ -329,6 +339,20 @@
                             </div>
                         </div>
                     </div>
+
+                    {% if alert_info %}
+                    <div class="card alert-card {{ alert_info.level|lower }}">
+                        <div class="card-content" style="padding: 1.2rem 1.5rem;">
+                            <div class="alert-head">
+                                <i class="fa-solid fa-bell-concierge" style="font-size: 1.2rem;"></i>
+                                <span class="alert-level">{{ alert_info.level }}</span>
+                                <div class="alert-title">{{ alert_info.title }}</div>
+                            </div>
+                            <div class="alert-row"><strong>Signal:</strong> {{ alert_info.reason }}</div>
+                            <div class="alert-row"><strong>Action:</strong> {{ alert_info.action }}</div>
+                        </div>
+                    </div>
+                    {% endif %}
 
                     <div class="card c-micro hover-theme-card">
                         <div class="card-content" style="padding: 2rem;">
@@ -686,20 +710,20 @@
                 });
             }, 800);
 
-            // --- DYNAMIC CHART.JS FORECAST GRAPH ---
+            // --- DYNAMIC CHART.JS FORECAST GRAPH (NEXT +5H FROM MODEL) ---
             setTimeout(() => {
                 const ctx = document.getElementById('forecastChart').getContext('2d');
-                const base = pm25Val ?? (aqiTarget / 2);
-                
-                const noise = () => (Math.random() * 16 - 8); 
-                const data = [
-                    Math.max(0, base + noise() * 1.5), 
-                    Math.max(0, base + noise()), 
-                    Math.max(0, base + noise() * 1.2), 
-                    Math.max(0, base + noise() * 0.8), 
-                    Math.max(0, base + noise() * 0.5), 
-                    base
-                ];
+                const labels = ['+1H', '+2H', '+3H', '+4H', '+5H'];
+                let data = (forecastData && forecastData.length > 0)
+                    ? forecastData.map(v => Number(v))
+                    : [aqiTarget, aqiTarget, aqiTarget, aqiTarget, aqiTarget];
+
+                if (data.length < 5) {
+                    const last = data.length > 0 ? data[data.length - 1] : aqiTarget;
+                    while (data.length < 5) data.push(last);
+                } else if (data.length > 5) {
+                    data = data.slice(0, 5);
+                }
                 
                 const gradient = ctx.createLinearGradient(0, 0, 0, 400);
                 gradient.addColorStop(0, `rgba(${rgbColor}, 0.5)`);
@@ -708,9 +732,9 @@
                 new Chart(ctx, {
                     type: 'line',
                     data: {
-                        labels: ['-5H', '-4H', '-3H', '-2H', '-1H', 'NOW'],
+                        labels: labels,
                         datasets: [{
-                            label: 'Predicted PM2.5 Trajectory',
+                            label: 'Predicted AQI Trajectory',
                             data: data,
                             borderColor: hexColor,
                             backgroundColor: gradient,
