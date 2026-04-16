@@ -2,6 +2,9 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import os
+from dotenv import load_dotenv
+load_dotenv()
+
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  
@@ -15,45 +18,53 @@ from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.seasonal import STL
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import MinMaxScaler
 from xgboost import XGBRegressor
-from keras.models import Sequential
-from keras.layers import Dense, LSTM
+# LSTM removed - no TensorFlow/Keras for Python 3.14
+# from keras.models import Sequential
+# from keras.layers import Dense, LSTM
 
 
 app = Flask(__name__)
 
-###########################################
-# EMERGENCY FALLBACK DATA GENERATOR
-###########################################
-def generate_fallback_data(city):
-    """If the Wi-Fi blocks the API, this generates realistic data so the demo doesn't crash."""
-    import pandas as pd
-    import numpy as np
-    
-    # Create a range of times for the last 120 hours
-    times = pd.date_range(end=pd.Timestamp.utcnow(), periods=120, freq='h')
-    
-    # Base realistic values depending on the city searched
-    base_pm = 65
-    city_lower = city.lower()
-    if "delhi" in city_lower:
-        base_pm = 190
-    elif "mumbai" in city_lower:
-        base_pm = 60
-    elif "chennai" in city_lower or "bangalore" in city_lower or "vellore" in city_lower:
-        base_pm = 45
+EU_COUNTRY_CODES = {
+    "AL", "AD", "AM", "AT", "AZ", "BA", "BE", "BG", "BY", "CH", "CY", "CZ", "DE", "DK",
+    "EE", "ES", "FI", "FR", "GB", "GE", "GR", "HR", "HU", "IE", "IS", "IT", "KZ", "LI",
+    "LT", "LU", "LV", "MC", "MD", "ME", "MK", "MT", "NL", "NO", "PL", "PT", "RO", "RS",
+    "RU", "SE", "SI", "SK", "SM", "TR", "UA", "VA"
+}
 
-    # Generate a dataframe with some random noise so it looks like real data
-    df = pd.DataFrame({
-        "time": times,
-        "pm25": [max(10, base_pm + np.random.normal(0, 15)) for _ in range(120)],
-        "temp": [25 + np.random.normal(0, 5) for _ in range(120)],
-        "humidity": [60 + np.random.normal(0, 15) for _ in range(120)],
-        "wind": [10 + np.random.normal(0, 3) for _ in range(120)]
-    })
-    
-    return df, df['pm25'].iloc[-1]
+
+def get_waqi_aqi(lat, lon):
+    token = os.getenv("WAQI_TOKEN", "").strip()
+    if not token or token.lower() == "demo":
+        return None
+
+    waqi_url = f"https://api.waqi.info/feed/geo:{lat};{lon}/"
+    resp = requests.get(waqi_url, params={"token": token}, timeout=10).json()
+    if resp.get("status") != "ok":
+        return None
+
+    data = resp.get("data", {})
+    aqi = data.get("aqi")
+    if aqi is None or str(aqi) == "-":
+        return None
+
+    pm25 = None
+    iaqi = data.get("iaqi", {})
+    if isinstance(iaqi, dict) and isinstance(iaqi.get("pm25"), dict):
+        pm25 = iaqi["pm25"].get("v")
+
+    station_name = "WAQI Station"
+    city_obj = data.get("city", {})
+    if isinstance(city_obj, dict) and city_obj.get("name"):
+        station_name = city_obj.get("name")
+
+    return {
+        "aqi": float(aqi),
+        "pm25": float(pm25) if pm25 is not None else None,
+        "system": "WAQI Local AQI",
+        "source": f"WAQI ({station_name})",
+    }
 
 ###########################################
 # GET REAL PM2.5 & WEATHER DATA
@@ -83,12 +94,20 @@ def get_pm25_series(city):
 
         lat = geo_response["results"][0]["latitude"]
         lon = geo_response["results"][0]["longitude"]
+        country_code = geo_response["results"][0].get("country_code", "")
+        country_name = geo_response["results"][0].get("country", "")
+
+        waqi_result = get_waqi_aqi(lat, lon)
+        if waqi_result is None:
+            raise Exception(
+                "WAQI AQI unavailable. Set a valid WAQI_TOKEN (not demo) to use the free city-station AQI API."
+            )
 
         # 2. Air Quality Fetch
         aq_url = "https://air-quality-api.open-meteo.com/v1/air-quality"
         aq_response = session.get(aq_url, params={
             "latitude": lat, "longitude": lon, 
-            "hourly": "pm2_5", "current": "pm2_5", "past_days": 7
+            "hourly": "pm2_5,european_aqi,us_aqi", "current": "pm2_5,european_aqi,us_aqi", "past_days": 7
         }, headers=headers, timeout=10).json()
 
         # 3. Weather Fetch
@@ -103,10 +122,14 @@ def get_pm25_series(city):
             raise Exception("The data provider is currently unresponsive. Try again in 1 minute.")
 
         current_pm25 = aq_response.get("current", {}).get("pm2_5")
+        current_eu_aqi = aq_response.get("current", {}).get("european_aqi")
+        current_us_aqi = aq_response.get("current", {}).get("us_aqi")
 
         df_aq = pd.DataFrame({
             "time": pd.to_datetime(aq_response["hourly"]["time"]),
-            "pm25": aq_response["hourly"]["pm2_5"]
+            "pm25": aq_response["hourly"]["pm2_5"],
+            "us_aqi": aq_response["hourly"].get("us_aqi", []),
+            "eu_aqi": aq_response["hourly"].get("european_aqi", [])
         })
 
         df_weather = pd.DataFrame({
@@ -124,57 +147,103 @@ def get_pm25_series(city):
         else:
             current_pm25 = df['pm25'].iloc[-1]
 
-        # Region Calibration (Delhi/North India Fix)
-        calibration_factor = 1.0
-        if 24.0 <= lat <= 32.0 and 72.0 <= lon <= 88.0:
-            calibration_factor = 4.2  
-        elif 18.0 <= lat < 24.0 and 68.0 <= lon <= 75.0:
-            calibration_factor = 1.0  
-        elif 8.0 <= lat < 18.0 and 74.0 <= lon <= 81.0:
-            calibration_factor = 1.1
+        # Fallback for cases where current.european_aqi may be unavailable.
+        if current_eu_aqi is None:
+            eu_aqi_series = aq_response.get("hourly", {}).get("european_aqi")
+            if eu_aqi_series and len(eu_aqi_series) > 0:
+                current_eu_aqi = eu_aqi_series[-1]
 
-        df['pm25'] = df['pm25'] * calibration_factor
-        current_pm25 = current_pm25 * calibration_factor
+        if current_us_aqi is None:
+            us_aqi_series = aq_response.get("hourly", {}).get("us_aqi")
+            if us_aqi_series and len(us_aqi_series) > 0:
+                current_us_aqi = us_aqi_series[-1]
 
-        return df, current_pm25
+        return (
+            df,
+            current_pm25,
+            current_us_aqi,
+            current_eu_aqi,
+            country_code,
+            country_name,
+            waqi_result,
+        )
 
-    except requests.exceptions.ConnectionError:
-        # Emergency Fallback: If the network is TRULY blocked, show the safety data
-        print("CRITICAL: Network Connection Refused. Engaging Fallback Mode.")
-        return generate_fallback_data(city)
+    except requests.exceptions.ConnectionError as e:
+        raise Exception("Unable to reach Open-Meteo API. Please check internet connection and try again.") from e
     except Exception as e:
         raise e
 
-    # --- GEOSPATIAL CALIBRATION MATRIX ---
-    # The European CAMS satellite model (45km grid) underestimates dense ground-level pollution in specific global regions.
-    # We apply precise geofenced coordinate bounding boxes to upscale orbital telemetry to match ground-truth IQAir sensors.
-    
-    calibration_factor = 1.0
-    
-    # 1. Indo-Gangetic Plain (Delhi, UP, Punjab) - Severe winter inversions & extreme ground density
-    if 24.0 <= lat <= 32.0 and 72.0 <= lon <= 88.0:
-        calibration_factor = 4.2  # Anchors Delhi's 20-25 CAMS to ~90-100 PM2.5 (AQI 170-210)
-        
-    # 2. Western India Coastal (Mumbai, Gujarat) - Good marine boundary layer dispersion
-    elif 18.0 <= lat < 24.0 and 68.0 <= lon <= 75.0:
-        calibration_factor = 1.0  # Remains untouched (AQI ~60)
-        
-    # 3. Southern India (Bangalore, Chennai, Vellore) - Tropical dispersion
-    elif 8.0 <= lat < 18.0 and 74.0 <= lon <= 81.0:
-        calibration_factor = 1.1
-        
-    # 4. Eastern/Central China - Heavy industrial zones
-    elif 22.0 <= lat <= 41.0 and 110.0 <= lon <= 123.0:
-        calibration_factor = 2.8
-        
-    # Default for Europe, US, etc. where CAMS is 1:1 accurate
-    else:
-        calibration_factor = 1.0
 
-    df['pm25'] = df['pm25'] * calibration_factor
-    current_pm25 = current_pm25 * calibration_factor
+def run_aqi_prediction_model(df, country_code, live_aqi):
+    """Predict next-hour AQI using historical AQI (not PM2.5-derived AQI)."""
+    if live_aqi is None:
+        return None
 
-    return df, current_pm25
+    use_eu = (country_code or "").upper() in EU_COUNTRY_CODES
+    preferred_col = "eu_aqi" if use_eu else "us_aqi"
+    fallback_col = "us_aqi" if use_eu else "eu_aqi"
+
+    aqi_series = pd.to_numeric(df.get(preferred_col), errors="coerce").ffill().bfill()
+    if aqi_series.notna().sum() < 30:
+        aqi_series = pd.to_numeric(df.get(fallback_col), errors="coerce").ffill().bfill()
+
+    aqi_series = aqi_series.dropna().reset_index(drop=True)
+    if len(aqi_series) < 30:
+        return round(float(live_aqi), 1)
+
+    # Align historical model state with the station-reported live AQI.
+    aqi_series.iloc[-1] = float(live_aqi)
+
+    try:
+        stl = STL(aqi_series, period=24, robust=True)
+        stl_result = stl.fit()
+
+        trend = stl_result.trend.dropna()
+        resid = stl_result.resid.dropna()
+
+        arima_future = ARIMA(trend, order=(1, 1, 1)).fit().forecast(steps=1).iloc[0]
+
+        df_ml = pd.DataFrame({
+            "resid": resid.values,
+            "temp": df["temp"].values[-len(resid):],
+            "humidity": df["humidity"].values[-len(resid):],
+            "wind": df["wind"].values[-len(resid):]
+        })
+
+        df_ml["lag1"] = df_ml["resid"].shift(1)
+        df_ml["lag2"] = df_ml["resid"].shift(2)
+        df_ml = df_ml.dropna()
+
+        if len(df_ml) < 20:
+            raw_pred = arima_future
+        else:
+            X = df_ml[["lag1", "lag2", "temp", "humidity", "wind"]].values
+            y = df_ml["resid"].values
+
+            rf = RandomForestRegressor(n_estimators=30, n_jobs=1)
+            rf.fit(X, y)
+
+            xgb = XGBRegressor(n_estimators=30, n_jobs=1)
+            xgb.fit(X, y)
+
+            latest = np.array([[
+                resid.iloc[-1],
+                resid.iloc[-2],
+                df["temp"].iloc[-1],
+                df["humidity"].iloc[-1],
+                df["wind"].iloc[-1]
+            ]])
+
+            rf_future = rf.predict(latest)[0]
+            xgb_future = xgb.predict(latest)[0]
+            raw_pred = arima_future + np.mean([rf_future, xgb_future])
+
+        max_change = max(15.0, float(live_aqi) * 0.20)
+        bounded_pred = min(float(live_aqi) + max_change, max(float(live_aqi) - max_change, float(raw_pred)))
+        bounded_pred = min(500.0, max(0.0, bounded_pred))
+        return round(bounded_pred, 1)
+    except Exception:
+        return round(float(live_aqi), 1)
 
 
 ###########################################
@@ -249,28 +318,9 @@ def run_ai_pipeline(df, current_pm25):
     # Safe bounds for R2 to ensure the live demo looks clean and professional 
     r2 = max(0.45, min(0.94, abs(raw_r2)))
 
-    scaler = MinMaxScaler()
-    scaled = scaler.fit_transform(series.values.reshape(-1,1))
-
-    X_lstm, y_lstm = [], []
-    for i in range(5, len(scaled)):
-        X_lstm.append(scaled[i-5:i])
-        y_lstm.append(scaled[i])
-
-    X_lstm, y_lstm = np.array(X_lstm), np.array(y_lstm)
-
-    model = Sequential([
-        LSTM(8, input_shape=(5,1)),
-        Dense(1)
-    ])
-    model.compile(loss="mse", optimizer="adam")
-    model.fit(X_lstm, y_lstm, epochs=2, verbose=0)
-
-    last_seq = scaled[-5:].reshape(1,5,1)
-    lstm_future = scaler.inverse_transform(model.predict(last_seq, verbose=0))[0][0]
-
+    # LSTM removed - using only ensemble methods
     hybrid_ml_future = arima_future + np.mean([rf_future, xgb_future])
-    final_prediction = np.mean([hybrid_ml_future, lstm_future])
+    final_prediction = hybrid_ml_future
 
     # Anchors the prediction tightly to the current live AQI to prevent extreme deviations
     max_change = current_pm25 * 0.10 
@@ -292,19 +342,55 @@ def run_ai_pipeline(df, current_pm25):
 # AQI CATEGORY FUNCTION
 ###########################################
 
-def get_aqi_category(pm25):
-    if pm25 <= 12:
+def select_local_aqi(country_code, current_us_aqi, current_eu_aqi):
+    code = (country_code or "").upper()
+
+    if code in EU_COUNTRY_CODES and current_eu_aqi is not None:
+        return float(current_eu_aqi), "European AQI"
+
+    if current_us_aqi is not None:
+        return float(current_us_aqi), "US AQI"
+
+    if current_eu_aqi is not None:
+        return float(current_eu_aqi), "European AQI"
+
+    return None, "AQI Unavailable"
+
+
+def get_aqi_category(aqi, system_label):
+    if "European AQI" in system_label:
+        # EAQI bands
+        if aqi <= 20:
+            return "Good"
+        elif aqi <= 40:
+            return "Moderate"
+        elif aqi <= 60:
+            return "Unhealthy for Sensitive Groups"
+        elif aqi <= 80:
+            return "Unhealthy"
+        elif aqi <= 100:
+            return "Severe"
+        else:
+            return "Hazardous"
+
+    # US/India/China AQI-like 0-500 bands
+    if aqi <= 50:
         return "Good"
-    elif pm25 <= 35.4:
+    elif aqi <= 100:
         return "Moderate"
-    elif pm25 <= 55.4:
+    elif aqi <= 150:
         return "Unhealthy for Sensitive Groups"
-    elif pm25 <= 150.4:
+    elif aqi <= 200:
         return "Unhealthy"
-    elif pm25 <= 250.4:
+    elif aqi <= 300:
         return "Severe"
     else:
         return "Hazardous"
+
+
+def get_multi_hour_forecast(prediction_1hr):
+    """UI expects a list; keep one AQI value (next-hour prediction)."""
+    return [round(float(prediction_1hr), 1)] if prediction_1hr is not None else []
 
 
 ###########################################
@@ -314,21 +400,57 @@ def get_aqi_category(pm25):
 @app.route("/", methods=["GET","POST"])
 def home():
     prediction = lower = upper = category = city = None
+    current_pm25 = None
+    aqi_system_label = None
+    aqi_source_label = None
+    country_name = None
     rmse = mae = mape = r2 = dominant_factor = None
+    hourly_forecasts = []
 
     if request.method == "POST":
         city = request.form["city"]
         try:
-            df, current_pm25 = get_pm25_series(city)
-            prediction, lower, upper, rmse, mae, mape, r2, dominant_factor = run_ai_pipeline(df, current_pm25)
-            category = get_aqi_category(prediction)
+            (
+                df,
+                current_pm25,
+                current_us_aqi,
+                current_eu_aqi,
+                country_code,
+                country_name,
+                waqi_result,
+            ) = get_pm25_series(city)
+            _, lower, upper, rmse, mae, mape, r2, dominant_factor = run_ai_pipeline(df, current_pm25)
+
+            if waqi_result is not None:
+                prediction = waqi_result["aqi"]
+                aqi_system_label = waqi_result["system"]
+                aqi_source_label = waqi_result["source"]
+                if waqi_result.get("pm25") is not None:
+                    current_pm25 = waqi_result["pm25"]
+            else:
+                prediction = None
+                aqi_system_label = "AQI Unavailable"
+                aqi_source_label = "None"
+
+            if prediction is None:
+                raise Exception("Live AQI is not available from the API for this city right now.")
+
+            # Predict AQI using AQI history model (not PM2.5-to-AQI approximation).
+            predicted_aqi = run_aqi_prediction_model(df, country_code, prediction)
+            hourly_forecasts = get_multi_hour_forecast(predicted_aqi)
+            
+            category = get_aqi_category(prediction, aqi_system_label)
         except Exception as e:
             return render_template("index.html", error=str(e), city=city)
 
     return render_template(
         "index.html",
         prediction=prediction, lower=lower, upper=upper, category=category,
-        city=city, rmse=rmse, mae=mae, mape=mape, r2=r2, dominant_factor=dominant_factor
+        city=city, current_pm25=current_pm25,
+        aqi_system_label=aqi_system_label, aqi_source_label=aqi_source_label,
+        country_name=country_name,
+        rmse=rmse, mae=mae, mape=mape, r2=r2, dominant_factor=dominant_factor,
+        hourly_forecasts=hourly_forecasts
     )
 
 

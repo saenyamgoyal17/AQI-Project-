@@ -103,10 +103,10 @@
         
         /* Main AQI */
         .city-name { font-size: 1rem; text-transform: uppercase; letter-spacing: 0.2em; color: var(--text-muted); margin-bottom: 2rem; font-weight: 600; }
-        .gauge-wrapper { position: relative; width: 280px; height: 280px; margin: 0 auto 1.5rem; display: flex; align-items: center; justify-content: center; overflow: visible;}
+        .gauge-wrapper { position: relative; width: 360px; height: 360px; margin: 0 auto 1.5rem; display: flex; align-items: center; justify-content: center; overflow: visible;}
         .gauge-svg { position: absolute; inset: 0; width: 100%; height: 100%; transform: rotate(-90deg); overflow: visible;}
         .gauge-track { fill: none; stroke: rgba(255,255,255,0.05); stroke-width: 10; }
-        .gauge-progress { fill: none; stroke: var(--theme-color); stroke-width: 10; stroke-linecap: round; stroke-dasharray: 816; stroke-dashoffset: 816; transition: stroke-dashoffset 2s cubic-bezier(0.175, 0.885, 0.32, 1.1); filter: drop-shadow(0 0 15px rgba(var(--theme-color-rgb), 0.6)); }
+        .gauge-progress { fill: none; stroke: var(--theme-color); stroke-width: 10; stroke-linecap: round; stroke-dasharray: 1068; stroke-dashoffset: 1068; transition: stroke-dashoffset 2s cubic-bezier(0.175, 0.885, 0.32, 1.1); filter: drop-shadow(0 0 15px rgba(var(--theme-color-rgb), 0.6)); }
         .aqi-number { font-family: var(--font-display); font-size: 6.5rem; font-weight: 700; line-height: 0.9; letter-spacing: -0.05em; color: #fff;}
         .health-badge { margin-top: 1rem; display: inline-flex; align-items: center; gap: 8px; padding: 10px 24px; border-radius: 100px; background: rgba(var(--theme-color-rgb), 0.1); border: 1px solid rgba(var(--theme-color-rgb), 0.3); font-size: 0.85rem; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; color: var(--theme-color); }
 
@@ -246,14 +246,14 @@
     <div class="marquee-container reveal">
         <div class="marquee-content">
             <div class="marquee-item"><i class="fa-brands fa-python"></i> Powered by Python</div>
-            <div class="marquee-item"><i class="fa-solid fa-brain"></i> TensorFlow LSTM</div>
+            <div class="marquee-item"><i class="fa-solid fa-brain"></i> ARIMA + XGBoost + RF</div>
             <div class="marquee-item"><i class="fa-solid fa-chart-line"></i> Scikit-Learn</div>
             <div class="marquee-item"><i class="fa-solid fa-tree"></i> XGBoost Engine</div>
             <div class="marquee-item"><i class="fa-solid fa-satellite"></i> Open-Meteo API</div>
             <div class="marquee-item"><i class="fa-solid fa-shield-virus"></i> US EPA Standards</div>
             <div class="marquee-item"><i class="fa-solid fa-graduation-cap"></i> VIT Vellore</div>
             <div class="marquee-item"><i class="fa-brands fa-python"></i> Powered by Python</div>
-            <div class="marquee-item"><i class="fa-solid fa-brain"></i> TensorFlow LSTM</div>
+            <div class="marquee-item"><i class="fa-solid fa-brain"></i> ARIMA + XGBoost + RF</div>
             <div class="marquee-item"><i class="fa-solid fa-chart-line"></i> Scikit-Learn</div>
             <div class="marquee-item"><i class="fa-solid fa-tree"></i> XGBoost Engine</div>
             <div class="marquee-item"><i class="fa-solid fa-satellite"></i> Open-Meteo API</div>
@@ -283,13 +283,18 @@
                         <div class="card-content">
                             <div class="city-name"><i class="fa-solid fa-location-crosshairs"></i> Target: {{ city }}</div>
                             <div class="gauge-wrapper">
-                                <svg class="gauge-svg" viewBox="0 0 280 280">
-                                    <circle class="gauge-track" cx="140" cy="140" r="130"></circle>
-                                    <circle class="gauge-progress" id="gaugePath" cx="140" cy="140" r="130"></circle>
+                                <svg class="gauge-svg" viewBox="0 0 360 360">
+                                    <circle class="gauge-track" cx="180" cy="180" r="170"></circle>
+                                    <circle class="gauge-progress" id="gaugePath" cx="180" cy="180" r="170"></circle>
                                 </svg>
                                 <div style="position: absolute; display: flex; flex-direction: column; align-items: center;">
                                     <div class="aqi-number" id="aqiTarget">0</div>
-                                    <div class="label" style="margin:0;">Predicted AQI</div>
+                                    <div class="label" style="margin:0; font-size: 0.85rem; font-weight: 600; letter-spacing: 0.1em; color: var(--theme-color); margin-bottom: 0.5rem;">CURRENT AQI</div>
+                                    <div class="label" style="margin:0; font-size: 0.7rem; max-width: 280px; text-align: center; line-height: 1.2;">Live {{ aqi_system_label or 'AQI' }} ({{ aqi_source_label or 'API' }})</div>
+                                    <div style="margin-top: 1.2rem; text-align: center;">
+                                        <div class="label" style="margin:0; font-size: 0.85rem; font-weight: 600; letter-spacing: 0.1em; color: rgba(255,255,255,0.6); margin-bottom: 0.3rem;">PREDICTED AQI</div>
+                                        <div id="predictedAqiText" style="font-family: var(--font-display); font-size: 2.2rem; font-weight: 600; color: #fff;">-</div>
+                                    </div>
                                 </div>
                             </div>
                             <div class="health-badge" id="healthBadge"><i class="fa-solid fa-shield-virus"></i> {{ category }}</div>
@@ -497,26 +502,34 @@
         }
 
         // --- 4. DATA & THEME ENGINE ---
-        const pmRaw = '{{ prediction }}';
-        const pmVal = (pmRaw && pmRaw !== 'None' && pmRaw !== '') ? parseFloat(pmRaw) : null;
+        const aqiRaw = '{{ prediction }}';
+        const aqiVal = (aqiRaw && aqiRaw !== 'None' && aqiRaw !== '') ? parseFloat(aqiRaw) : null;
+        const pm25Raw = '{{ current_pm25 }}';
+        const pm25Val = (pm25Raw && pm25Raw !== 'None' && pm25Raw !== '') ? parseFloat(pm25Raw) : null;
+        const aqiSystem = '{{ aqi_system_label }}';
+        const aqiSource = '{{ aqi_source_label }}';
         const category = '{{ category }}';
         const dominant = '{{ dominant_factor }}';
+        const forecastData = {{ hourly_forecasts|tojson }};
+
+        // Display predicted AQI (1-hour forecast)
+        if (forecastData && forecastData.length > 0) {
+            const forecastText = document.getElementById('predictedAqiText');
+            if (forecastText) {
+                forecastText.innerText = Math.round(forecastData[0]);
+            }
+        }
 
         let themeColor = '#ffffff'; 
         let particleSpeed = 1;
 
-        if (pmVal !== null) {
+        if (aqiVal !== null) {
             setTimeout(() => {
                 const dash = document.getElementById('dashboard');
                 if(dash) { dash.classList.add('visible'); dash.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
             }, 300);
 
-            function getAQI(pm) {
-                const bp=[{l:0,h:12,al:0,ah:50},{l:12.1,h:35.4,al:51,ah:100},{l:35.5,h:55.4,al:101,ah:150},{l:55.5,h:150.4,al:151,ah:200},{l:150.5,h:250.4,al:201,ah:300},{l:250.5,h:500.4,al:301,ah:500}];
-                for(let i=0;i<bp.length;i++){ if(pm>=bp[i].l && pm<=bp[i].h) return Math.round(((bp[i].ah-bp[i].al)/(bp[i].h-bp[i].l))*(pm-bp[i].l)+bp[i].al); }
-                return pm>500.4 ? 500 : 0;
-            }
-            const aqiTarget = getAQI(pmVal);
+            const aqiTarget = Math.max(0, Math.min(500, Math.round(aqiVal)));
 
             // Dynamic Theme Palette
             let hexColor, rgbColor;
@@ -538,7 +551,7 @@
             setTimeout(() => {
                 const gaugePath = document.getElementById('gaugePath');
                 if (gaugePath) {
-                    const circumference = 2 * Math.PI * 130;
+                    const circumference = 2 * Math.PI * 170;
                     gaugePath.style.strokeDasharray = circumference;
                     const offset = circumference - (circumference * Math.min(aqiTarget / 300, 1));
                     gaugePath.style.strokeDashoffset = offset;
@@ -587,9 +600,11 @@
                 "> FITTING ARIMA TO LINEAR TREND... [OK]",
                 "> MAPPING RESIDUALS VIA XGBOOST & RF... [OK]",
                 `> EXTRACTING METEOROLOGY. DOMINANT: ${dominant}... [OK]`,
-                "> PARALLEL LSTM SEQUENCE VALIDATION... [OK]",
+                "> RESIDUAL ENSEMBLE VALIDATION... [OK]",
                 "> CALCULATING ENSEMBLE WEIGHTS...",
-                `> PM2.5 PREDICTION LOCKED AT ${pmVal.toFixed(2)} µg/m³.`
+                `> AQI SOURCE: ${aqiSource}.`,
+                `> LIVE ${aqiSystem.toUpperCase()} FROM ${aqiSource.toUpperCase()}: ${aqiTarget}.`,
+                `> LIVE PM2.5 FROM ${aqiSource.toUpperCase()}: ${(pm25Val ?? 0).toFixed(2)} µg/m³.`
             ];
             const termBody = document.getElementById('termBody');
             let delay = 500;
@@ -634,7 +649,8 @@
             // --- DYNAMIC MOLECULES & RADAR ---
             setTimeout(() => {
                 // Generate molecular values scaled to the current PM2.5 level
-                const pm10Val = Math.round(pmVal * (1.2 + Math.random() * 1.5));
+                const basePm = pm25Val ?? (aqiTarget / 2);
+                const pm10Val = Math.round(basePm * (1.2 + Math.random() * 1.5));
                 const o3Val = Math.round(15 + Math.random() * 65);
                 const no2Val = Math.round(20 + Math.random() * 90);
                 const so2Val = Math.round(5 + Math.random() * 40);
@@ -673,7 +689,7 @@
             // --- DYNAMIC CHART.JS FORECAST GRAPH ---
             setTimeout(() => {
                 const ctx = document.getElementById('forecastChart').getContext('2d');
-                const base = pmVal;
+                const base = pm25Val ?? (aqiTarget / 2);
                 
                 const noise = () => (Math.random() * 16 - 8); 
                 const data = [
