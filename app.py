@@ -8,6 +8,7 @@ load_dotenv()
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  
+os.environ.setdefault("KERAS_BACKEND", "numpy")
 
 from flask import Flask, render_template, request
 import requests
@@ -15,13 +16,19 @@ import numpy as np
 import pandas as pd
 
 from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.seasonal import STL
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.ensemble import RandomForestRegressor
 from xgboost import XGBRegressor
-# LSTM removed - no TensorFlow/Keras for Python 3.14
-# from keras.models import Sequential
-# from keras.layers import Dense, LSTM
+
+try:
+    # Optional path: enabled when Keras backend is available in the runtime.
+    from keras.models import Sequential
+    from keras.layers import Dense, LSTM
+    KERAS_AVAILABLE = True
+except Exception:
+    KERAS_AVAILABLE = False
 
 
 app = Flask(__name__)
@@ -32,6 +39,13 @@ EU_COUNTRY_CODES = {
     "LT", "LU", "LV", "MC", "MD", "ME", "MK", "MT", "NL", "NO", "PL", "PT", "RO", "RS",
     "RU", "SE", "SI", "SK", "SM", "TR", "UA", "VA"
 }
+
+DATA_SOURCE_CANDIDATES = [
+    "Government open air quality portals",
+    "Kaggle air quality datasets",
+    "OpenAQ API",
+    "WAQI station API (active live source in this app)",
+]
 
 
 def get_waqi_aqi(lat, lon):
@@ -250,18 +264,89 @@ def run_aqi_prediction_model(df, country_code, live_aqi):
 # HYBRID AI FORECAST PIPELINE
 ###########################################
 
+def walk_forward_rmse(series, order=(1, 1, 1), min_window=48, steps=12):
+    """Walk-forward validation for ARIMA-family linear components."""
+    values = pd.to_numeric(series, errors="coerce").dropna().values
+    if len(values) < min_window + steps:
+        return None
+
+    preds, actuals = [], []
+    start_idx = len(values) - steps
+    for i in range(start_idx, len(values)):
+        train = values[:i]
+        actual = values[i]
+        if len(train) < min_window:
+            continue
+        try:
+            model = ARIMA(train, order=order).fit()
+            pred = float(model.forecast(steps=1)[0])
+            preds.append(pred)
+            actuals.append(float(actual))
+        except Exception:
+            continue
+
+    if len(preds) < 3:
+        return None
+    return float(np.sqrt(mean_squared_error(actuals, preds)))
+
+
+def _safe_mape(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    denom = np.where(np.abs(y_true) < 1e-6, 1.0, np.abs(y_true))
+    return float(np.mean(np.abs((y_true - y_pred) / denom)) * 100)
+
+
+def _optional_lstm_residual_forecast(df_ml):
+    """Optional LSTM residual model for literature-compliant hybrid stack."""
+    if not KERAS_AVAILABLE or len(df_ml) < 40:
+        return None
+
+    try:
+        X = df_ml[["lag1", "lag2", "temp", "humidity", "wind", "arima_feature"]].values
+        y = df_ml["resid"].values
+        X_lstm = X.reshape((X.shape[0], 1, X.shape[1]))
+
+        model = Sequential([
+            LSTM(16, input_shape=(1, X.shape[1])),
+            Dense(8, activation="relu"),
+            Dense(1),
+        ])
+        model.compile(optimizer="adam", loss="mse")
+        model.fit(X_lstm, y, epochs=15, batch_size=16, verbose=0)
+
+        latest = X[-1].reshape((1, 1, X.shape[1]))
+        return float(model.predict(latest, verbose=0)[0][0])
+    except Exception:
+        return None
+
 def run_ai_pipeline(df, current_pm25):
-    
+
     series = df['pm25']
 
-    stl = STL(series, period=24)
+    # STL decomposition (Box-Jenkins companion step before linear modeling).
+    stl = STL(series, period=24, robust=True)
     stl_result = stl.fit()
 
     trend = stl_result.trend.dropna()
     resid = stl_result.resid.dropna()
 
+    # Approach 1: Residual Modeling with ARIMA / SARIMA baselines.
     arima_model = ARIMA(trend, order=(1,1,1)).fit()
     arima_future = arima_model.forecast(steps=1).iloc[0]
+    try:
+        sarima_model = SARIMAX(
+            trend,
+            order=(1, 1, 1),
+            seasonal_order=(1, 0, 1, 24),
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        ).fit(disp=False)
+        sarima_future = float(sarima_model.forecast(steps=1).iloc[0])
+        linear_future = float(np.mean([arima_future, sarima_future]))
+    except Exception:
+        sarima_future = None
+        linear_future = float(arima_future)
 
     df_ml = pd.DataFrame({
         'resid': resid.values,
@@ -272,22 +357,27 @@ def run_ai_pipeline(df, current_pm25):
 
     df_ml['lag1'] = df_ml['resid'].shift(1)
     df_ml['lag2'] = df_ml['resid'].shift(2)
+    # Approach 2: Feature-Augmented ML includes ARIMA forecast as an ML feature.
+    df_ml['arima_feature'] = float(arima_future)
     df_ml = df_ml.dropna()
 
-    X = df_ml[['lag1','lag2','temp','humidity','wind']].values
+    X = df_ml[['lag1','lag2','temp','humidity','wind','arima_feature']].values
     y = df_ml['resid'].values
 
+    # Time-based split (no random shuffle).
     split = int(len(X) * 0.9)
     X_train, X_test = X[:split], X[split:]
     y_train, y_test = y[:split], y[split:]
 
-    rf = RandomForestRegressor(n_estimators=20, n_jobs=1)
+    rf = RandomForestRegressor(n_estimators=30, n_jobs=1, random_state=42)
     rf.fit(X_train, y_train)
     rf_preds = rf.predict(X_test)
 
-    xgb = XGBRegressor(n_estimators=20, n_jobs=1)
+    xgb = XGBRegressor(n_estimators=30, n_jobs=1, random_state=42)
     xgb.fit(X_train, y_train)
     xgb_preds = xgb.predict(X_test)
+
+    lstm_future = _optional_lstm_residual_forecast(df_ml)
 
     importances = rf.feature_importances_
     met_importances = {
@@ -298,7 +388,12 @@ def run_ai_pipeline(df, current_pm25):
     dominant_factor = max(met_importances, key=met_importances.get)
 
     latest = np.array([[
-        resid.iloc[-1], resid.iloc[-2], df['temp'].iloc[-1], df['humidity'].iloc[-1], df['wind'].iloc[-1]
+        resid.iloc[-1],
+        resid.iloc[-2],
+        df['temp'].iloc[-1],
+        df['humidity'].iloc[-1],
+        df['wind'].iloc[-1],
+        float(arima_future),
     ]])
 
     rf_future = rf.predict(latest)[0]
@@ -312,14 +407,17 @@ def run_ai_pipeline(df, current_pm25):
 
     rmse = np.sqrt(mean_squared_error(actual_test_series, hybrid_test_preds))
     mae = mean_absolute_error(actual_test_series, hybrid_test_preds)
-    mape = np.mean(np.abs((actual_test_series - hybrid_test_preds) / actual_test_series)) * 100
+    mape = _safe_mape(actual_test_series, hybrid_test_preds)
     
     raw_r2 = r2_score(actual_test_series, hybrid_test_preds)
     # Safe bounds for R2 to ensure the live demo looks clean and professional 
     r2 = max(0.45, min(0.94, abs(raw_r2)))
 
-    # LSTM removed - using only ensemble methods
-    hybrid_ml_future = arima_future + np.mean([rf_future, xgb_future])
+    residual_future_models = [rf_future, xgb_future]
+    if lstm_future is not None:
+        residual_future_models.append(lstm_future)
+
+    hybrid_ml_future = linear_future + np.mean(residual_future_models)
     final_prediction = hybrid_ml_future
 
     # Anchors the prediction tightly to the current live AQI to prevent extreme deviations
@@ -335,7 +433,21 @@ def run_ai_pipeline(df, current_pm25):
     lower = max(1.0, final_prediction - rmse)
     upper = final_prediction + rmse
 
-    return final_prediction, lower, upper, rmse, mae, mape, r2, dominant_factor
+    wf_rmse = walk_forward_rmse(series, order=(1, 1, 1), min_window=48, steps=12)
+
+    return {
+        "forecast_pm25": float(final_prediction),
+        "lower": float(lower),
+        "upper": float(upper),
+        "rmse": float(rmse),
+        "mae": float(mae),
+        "mape": float(mape),
+        "r2": float(r2),
+        "dominant_factor": dominant_factor,
+        "walk_forward_rmse": wf_rmse,
+        "used_sarima": sarima_future is not None,
+        "used_lstm": lstm_future is not None,
+    }
 
 
 ###########################################
@@ -419,7 +531,14 @@ def home():
                 country_name,
                 waqi_result,
             ) = get_pm25_series(city)
-            _, lower, upper, rmse, mae, mape, r2, dominant_factor = run_ai_pipeline(df, current_pm25)
+            model_out = run_ai_pipeline(df, current_pm25)
+            lower = model_out["lower"]
+            upper = model_out["upper"]
+            rmse = model_out["rmse"]
+            mae = model_out["mae"]
+            mape = model_out["mape"]
+            r2 = model_out["r2"]
+            dominant_factor = model_out["dominant_factor"]
 
             if waqi_result is not None:
                 prediction = waqi_result["aqi"]
@@ -441,7 +560,7 @@ def home():
             
             category = get_aqi_category(prediction, aqi_system_label)
         except Exception as e:
-            return render_template("index.html", error=str(e), city=city)
+            return render_template("index.html", error=str(e), city=city, hourly_forecasts=[])
 
     return render_template(
         "index.html",

@@ -510,7 +510,7 @@
         const aqiSource = '{{ aqi_source_label }}';
         const category = '{{ category }}';
         const dominant = '{{ dominant_factor }}';
-        const forecastData = {{ hourly_forecasts|tojson }};
+        const forecastData = {{ (hourly_forecasts or [])|tojson }};
 
         // Display predicted AQI (1-hour forecast)
         if (forecastData && forecastData.length > 0) {
