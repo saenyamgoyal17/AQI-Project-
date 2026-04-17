@@ -299,8 +299,8 @@ def run_aqi_multi_step_forecast(df, country_code, live_aqi, steps=5):
             residual_pred = float(np.mean(residual_components))
             raw_aqi = a_feature + residual_pred
 
-            # Recursive stability bound relative to previous hour.
-            step_bound = max(12.0, prev_aqi * 0.18)
+            # Recursive stability bound relative to previous hour - more flexible for real changes.
+            step_bound = max(20.0, prev_aqi * 0.25)
             bounded = min(prev_aqi + step_bound, max(prev_aqi - step_bound, raw_aqi))
             bounded = min(500.0, max(0.0, bounded))
             forecast.append(round(float(bounded), 1))
@@ -472,8 +472,8 @@ def run_ai_pipeline(df, current_pm25):
     mape = _safe_mape(actual_test_series, hybrid_test_preds)
     
     raw_r2 = r2_score(actual_test_series, hybrid_test_preds)
-    # Safe bounds for R2 to ensure the live demo looks clean and professional 
-    r2 = max(0.45, min(0.94, abs(raw_r2)))
+    # Ensure R2 stays within valid bounds (0 to 1)
+    r2 = max(0.0, min(1.0, abs(raw_r2)))
 
     residual_future_models = [rf_future, xgb_future]
     if lstm_future is not None:
@@ -482,8 +482,8 @@ def run_ai_pipeline(df, current_pm25):
     hybrid_ml_future = linear_future + np.mean(residual_future_models)
     final_prediction = hybrid_ml_future
 
-    # Anchors the prediction tightly to the current live AQI to prevent extreme deviations
-    max_change = current_pm25 * 0.10 
+    # Allow realistic changes in air quality while preventing extreme outliers
+    max_change = current_pm25 * 0.20
 
     if final_prediction > current_pm25 + max_change:
         final_prediction = current_pm25 + max_change
@@ -664,9 +664,13 @@ def home():
             dominant_factor = model_out["dominant_factor"]
 
             if waqi_result is not None:
+                # Use WAQI AQI (consistent scale) for display and categorization
                 prediction = waqi_result["aqi"]
                 aqi_system_label = waqi_result["system"]
                 aqi_source_label = waqi_result["source"]
+                # Remove "US " prefix for cleaner display
+                if aqi_system_label and aqi_system_label.startswith("US "):
+                    aqi_system_label = aqi_system_label.replace("US ", "")
                 if waqi_result.get("pm25") is not None:
                     current_pm25 = waqi_result["pm25"]
             else:
